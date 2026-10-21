@@ -1,5 +1,7 @@
 __pycache__/
 test.ipynb
-
+.venv
 multilingual_mixed.parquet
+checkpoints/
+logs/
 checkpoints/

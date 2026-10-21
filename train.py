@@ -4,7 +4,7 @@ import math
 from pathlib import Path
 
 import torch
-from datasets import load_dataset
+from datasets import load_from_disk
 from liger_kernel.transformers import LigerCrossEntropyLoss
 from torch.optim import AdamW, Muon, Optimizer
 from torch.optim.lr_scheduler import LambdaLR
@@ -16,6 +16,7 @@ from components import (
     init_model_weights,
 )
 from components.config import tokenizer
+from csv_logger import CSVLogger
 from packed_dataloader import make_packed_dataloader
 
 
@@ -87,7 +88,7 @@ def train_step(
     model: MoETransformerLM,
     muon: Muon,
     adamw: AdamW,
-    schedulers: tuple[LambdaLR, ...],
+    schedulers: tuple[LambdaLR, ...] | None,
     input_ids: torch.Tensor,
     tcfg: TrainingConfig,
     ce: LigerCrossEntropyLoss,
@@ -113,8 +114,10 @@ def train_step(
     # One scheduler per optimizer (LambdaLR binds to a single optimizer, and
     # torch's ChainedScheduler rejects schedulers from different optimizers).
     # Must run after optimizer.step(), or the first schedule value is skipped.
-    for sched in schedulers:
-        sched.step()
+    if schedulers is not None:
+        for sched in schedulers:
+            sched.step()
+
     muon.zero_grad(set_to_none=True)
     adamw.zero_grad(set_to_none=True)
 
@@ -223,24 +226,91 @@ def evaluate(
 def main() -> None:
 
     torch.set_default_dtype(torch.float32)
+
     assert torch.cuda.is_available(), (
         "training requires CUDA (Liger Kernels are CUDA-only)"
     )
     device = torch.device("cuda")
 
     mcfg = ModelConfig()
+
     tcfg = TrainingConfig()
+
+    csv_logger = CSVLogger(
+        log_dir="logs",
+        run_id="1792441907",
+    )
     ce = LigerCrossEntropyLoss()
 
     assert tcfg.block_size <= mcfg.context_len, "block_size must be <= context_len"
+    ckpt_dir = Path(tcfg.checkpoint_dir)
 
     model = MoETransformerLM(mcfg).to(device)
     init_model_weights(model)
+
     model.train()
+
     muon, adamw = build_optimizers(model, tcfg)
 
+    # ---- resume ----
+    # Restore before the schedulers exist: LambdaLR reads "initial_lr" from the
+    # param groups at construction and the checkpoint already carries it.
+    resume_step, resume_epoch, resume_row = 0, 0, 0
+    if tcfg.resume_from is not None:
+        resume_step, resume_epoch, resume_row = load_checkpoint(
+            tcfg.resume_from, model, muon, adamw
+        )
+        print(
+            f"[ckpt] resumed step={resume_step} epoch={resume_epoch} "
+            f"row={resume_row} from {tcfg.resume_from}"
+        )
+
+    # ---- enforce configured learning rates when scheduler is disabled ----
+    if not tcfg.use_lr_scheduler:
+        for group in muon.param_groups:
+            group["lr"] = tcfg.lr_muon
+
+        for group in adamw.param_groups:
+            group["lr"] = tcfg.lr_adamw
+
+        print(
+            f"[optim] fixed LR enforced: "
+            f"muon={tcfg.lr_muon:.3e}, adamw={tcfg.lr_adamw:.3e}"
+        )
+
+    # ---- LR schedule ----
+    if tcfg.use_lr_scheduler:
+        num_training_steps = tcfg.num_training_steps
+
+        if num_training_steps is None or num_training_steps < 1:
+            raise ValueError(
+                "num_training_steps must be >= 1 when LR scheduling is enabled"
+            )
+
+        num_warmup_steps = min(tcfg.num_warmup_steps, num_training_steps)
+
+        if num_warmup_steps != tcfg.num_warmup_steps:
+            print(
+                f"[sched] warmup clamped {tcfg.num_warmup_steps} -> {num_warmup_steps}"
+            )
+
+        schedulers: tuple[LambdaLR, ...] | None = tuple(
+            CosineScheduler_WarmUp(opt, num_warmup_steps, num_training_steps)
+            for opt in (muon, adamw)
+        )
+
+        print(
+            f"[sched] cosine: {num_warmup_steps} warmup / "
+            f"{num_training_steps} total steps; "
+            f"peak lr muon={tcfg.lr_muon} "
+            f"adamw={tcfg.lr_adamw}"
+        )
+    else:
+        schedulers = None
+        print(f"[sched] disabled; fixed lr muon={tcfg.lr_muon} adamw={tcfg.lr_adamw}")
+
     # ---- data ----
-    full_dataset = load_dataset("parquet", data_files=tcfg.data_path, split="train")
+    full_dataset = load_from_disk(tcfg.data_path)
     all_indices = list(range(len(full_dataset)))
 
     val_indices = all_indices[: tcfg.val_size]
@@ -249,16 +319,15 @@ def main() -> None:
     val_dataset = full_dataset.select(val_indices)
     train_dataset = full_dataset.select(train_indices)
 
-    def make_train_loader(start_row_index: int = 0):
-        return make_packed_dataloader(
-            train_dataset,
-            tokenizer,
-            text_column=tcfg.text_column,
-            block_size=tcfg.block_size,
-            batch_size=tcfg.batch_size,
-            append_eos=True,
-            start_row_index=start_row_index,
-        )
+    train_loader = make_packed_dataloader(
+        train_dataset,
+        tokenizer,
+        text_column=tcfg.text_column,
+        block_size=tcfg.block_size,
+        batch_size=tcfg.batch_size,
+        append_eos=True,
+        start_row_index=resume_row,
+    )
 
     val_loader = make_packed_dataloader(
         val_dataset,
@@ -269,112 +338,67 @@ def main() -> None:
         append_eos=True,
     )
 
-    # ---- resume ----
-    # Restore before the schedulers exist: LambdaLR reads "initial_lr" from the
-    # param groups at construction and the checkpoint already carries it.
-    if tcfg.resume_from is not None:
-        resume_step, resume_epoch, resume_row = 0, 0, 0
-        resume_step, resume_epoch, resume_row = load_checkpoint(
-            tcfg.resume_from, model, muon, adamw
-        )
-        print(
-            f"[ckpt] resumed step={resume_step} epoch={resume_epoch} "
-            f"row={resume_row} from {tcfg.resume_from}"
-        )
+    try:
+        step = resume_step
+        for epoch in range(resume_epoch, tcfg.num_epochs):
+            # The resumed epoch continues from the saved row; later epochs start over.
+            for input_ids, _labels, _attn_mask, data_index in train_loader:
+                input_ids = input_ids.to(device, non_blocking=True)
+                logs = train_step(model, muon, adamw, schedulers, input_ids, tcfg, ce)
 
-    # ---- LR schedule ----
-    # The loader streams and has no __len__, so the epoch length is unknown up
-    # front. Resolve the horizon: max_steps wins (smoke test), then an explicit
-    # num_training_steps (skips the pass), else count exactly. Always measured
-    # from row 0, so a resume does not shrink the horizon.
-    if tcfg.max_steps is not None:
-        num_training_steps = tcfg.max_steps
-        print(f"[sched] horizon = max_steps = {num_training_steps}")
-    elif tcfg.num_training_steps is not None:
-        num_training_steps = tcfg.num_training_steps
-        print(f"[sched] horizon = num_training_steps = {num_training_steps}")
-    else:
-        steps_per_epoch = count_steps(make_train_loader(0))
-        num_training_steps = tcfg.num_epochs * steps_per_epoch
-        print(
-            f"[sched] counted {steps_per_epoch} steps/epoch; horizon = "
-            f"{tcfg.num_epochs} epoch(s) x {steps_per_epoch} = "
-            f"{num_training_steps} (set TrainingConfig.num_training_steps to "
-            f"skip this pass)"
-        )
-
-    # CosineScheduler_WarmUp requires 0 <= warmup <= horizon.
-    num_warmup_steps = min(tcfg.num_warmup_steps, num_training_steps)
-    if num_warmup_steps != tcfg.num_warmup_steps:
-        print(f"[sched] warmup clamped {tcfg.num_warmup_steps} -> {num_warmup_steps}")
-
-    # Both schedulers share the same curve; each multiplies its own optimizer's
-    # initial LR (muon 0.02, adamw 3e-4), so the peaks stay independent.
-    schedulers: tuple[LambdaLR, ...] = tuple(
-        CosineScheduler_WarmUp(opt, num_warmup_steps, num_training_steps)
-        for opt in (muon, adamw)
-    )
-
-    # The schedule is a pure function of the step, so a resume rebuilds it by
-    # replaying rather than storing scheduler state.
-    if resume_step:
-        for _ in range(resume_step):
-            for sched in schedulers:
-                sched.step()
-        print(
-            f"[sched] fast-forwarded {resume_step} steps -> "
-            f"lr muon={muon.param_groups[0]['lr']:.3e} "
-            f"adamw={adamw.param_groups[0]['lr']:.3e}"
-        )
-
-    print(
-        f"[sched] {num_warmup_steps} warmup / {num_training_steps} total steps; "
-        f"peak lr muon={tcfg.lr_muon} adamw={tcfg.lr_adamw}"
-    )
-
-    ckpt_path = Path(tcfg.checkpoint_dir) / "ckpt.pt"
-
-    step = resume_step
-    for epoch in range(resume_epoch, tcfg.num_epochs):
-        # The resumed epoch continues from the saved row; later epochs start over.
-        start_row = resume_row if epoch == resume_epoch else 0
-        for input_ids, _labels, _attn_mask, data_index in make_train_loader(start_row):
-            input_ids = input_ids.to(device, non_blocking=True)
-            logs = train_step(model, muon, adamw, schedulers, input_ids, tcfg, ce)
-
-            if step % tcfg.log_every == 0:
-                print()
-                print(
-                    f"[🔥train] epoch: {epoch} | step: {step} | "
-                    f"lm_loss: {logs['lm_loss']:.4f} | "
-                    f"ppl: {perplexity(logs['lm_loss']):.2f} | "
-                    f"aux_loss: {logs['aux_loss']:.4f} | "
-                    f"z_loss: {logs['z_loss']:.4f} | "
-                    f"total_loss: {logs['total_loss']:.4f} | "
-                    f"lr_muon: {logs['lr_muon']:.3e} | "
-                    f"lr_adamw: {logs['lr_adamw']:.3e}"
-                )
-
-                val_loss = evaluate(model, val_loader, tcfg, ce, device)
-                if val_loss is not None:
+                if step % tcfg.log_every == 0:
+                    print()
                     print(
-                        f"[🧪val] step: {step} | "
-                        f"val_lm_loss: {val_loss:.4f} | "
-                        f"val_ppl: {perplexity(val_loss):.2f}"
+                        f"[🔥train] epoch: {epoch} | step: {step} | "
+                        f"lm_loss: {logs['lm_loss']:.4f} | "
+                        f"ppl: {perplexity(logs['lm_loss']):.2f} | "
+                        f"aux_loss: {logs['aux_loss']:.4f} | "
+                        f"z_loss: {logs['z_loss']:.4f} | "
+                        f"total_loss: {logs['total_loss']:.4f} | "
+                        f"lr_muon: {logs['lr_muon']:.3e} | "
+                        f"lr_adamw: {logs['lr_adamw']:.3e}"
                     )
 
-            step += 1
-            if tcfg.checkpoint_every is not None and step % tcfg.checkpoint_every == 0:
-                # data_index[0] is the source row of the batch's first block.
-                # Resuming there replays that batch's rows but never skips any.
-                save_checkpoint(
-                    ckpt_path, model, muon, adamw, step, epoch, int(data_index[0])
-                )
-                print(f"[ckpt] saved step={step} -> {ckpt_path}")
+                    val_loss = evaluate(model, val_loader, tcfg, ce, device)
+                    if val_loss is not None:
+                        print(
+                            f"[🧪val] step: {step} | "
+                            f"val_lm_loss: {val_loss:.4f} | "
+                            f"val_ppl: {perplexity(val_loss):.2f}"
+                        )
 
-            if tcfg.max_steps is not None and step >= tcfg.max_steps:
-                print(f"reached max_steps={tcfg.max_steps}, stopping")
-                return
+                    csv_logger.log(
+                        perplexity_fn=perplexity,
+                        epoch=epoch,
+                        step=step,
+                        logs=logs,
+                        val_lm_loss=val_loss,
+                    )
+
+                step += 1
+                if (
+                    tcfg.checkpoint_every is not None
+                    and step % tcfg.checkpoint_every == 0
+                ):
+                    # data_index[0] is the source row of the batch's first block.
+                    # Resuming there replays that batch's rows but never skips any.
+                    ckpt_path = ckpt_dir / f"CatMOE_step_{step}.pt"
+                    save_checkpoint(
+                        ckpt_path, model, muon, adamw, step, epoch, int(data_index[0])
+                    )
+                    print(f"[📦ckpt] saved step={step} -> {ckpt_path}")
+
+                if (
+                    tcfg.use_lr_scheduler
+                    and tcfg.num_training_steps is not None
+                    and step >= tcfg.num_training_steps
+                ):
+                    print(
+                        f"reached num_training_steps={tcfg.num_training_steps}, stopping"
+                    )
+                    return
+    finally:
+        csv_logger.close()
 
 
 if __name__ == "__main__":

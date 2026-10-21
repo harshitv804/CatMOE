@@ -34,18 +34,17 @@ class TrainingConfig:
     """Single source of truth for the training loop. Every field below is consumed somewhere."""
 
     # Data
-    data_path: str = "multilingual_mixed.parquet"
+    data_path: str = "F:\\IndicCorpV2_Mixed"
     text_column: str = "text"
-    val_size: int = 240  # first VAL_SIZE rows are held out for validation
+    val_size: int = 10000  # first VAL_SIZE rows are held out for validation
 
     # Batching / schedule
     block_size: int = (
-        100  # must be <= ModelConfig.context_len (RoPE covers exactly context_len)
+        1024  # must be <= ModelConfig.context_len (RoPE covers exactly context_len)
     )
-    batch_size: int = 2
+    batch_size: int = 6
     num_epochs: int = 1
-    max_steps: int | None = None  # set an int for a quick smoke test
-    log_every: int = 10
+    log_every: int = 100
 
     # Precision / loss weights
     use_bf16: bool = True  # autocast dtype; master weights stay fp32
@@ -54,19 +53,22 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
 
     # Optimizer - placeholder hyperparameters, tune to taste.
-    lr_muon: float = 0.02
-    lr_adamw: float = 3e-4
+    lr_muon: float = 1e-4  # 0.02
+    lr_adamw: float = 1e-5  # 3e-4
     weight_decay: float = 0.1
     betas: tuple[float, float] = (0.9, 0.95)
 
+    use_lr_scheduler: bool = False
     # LR schedule (cosine with linear warmup, shared by both optimizers)
-    num_warmup_steps: int = 500
+    num_warmup_steps: int = 5_000
     # None -> count the exact number of steps with one tokenize-only pass over
     # the loader (it streams and has no __len__), then multiply by num_epochs.
     # Set an int to skip that pass.
-    num_training_steps: int | None = 60000
+    num_training_steps: int | None = 100_000
 
     # Checkpointing (one rolling file: ~3.7 GB with the current model config)
     checkpoint_dir: str = "checkpoints"
     checkpoint_every: int | None = 1000  # None disables writing checkpoints
-    resume_from: str | None = None  # path to a checkpoint to resume from
+    resume_from: str | None = (
+        "checkpoints/ckpt_22000.pt"  # path to a checkpoint to resume from
+    )
